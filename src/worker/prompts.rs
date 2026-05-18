@@ -292,11 +292,6 @@ You are the lead reviewer consolidating feedback from multiple specialized analy
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply. Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions."
             }
-            10 => {
-                "# Stage 10. Fix generation
-
-You are an expert kernel developer writing patches to fix bugs found during review. Generate git-formatted patches to address the provided findings. Ensure the code conforms to kernel style guidelines and compiles cleanly mentally. Double-check that your fixes do not introduce new regressions."
-            }
             _ => "",
         };
 
@@ -1076,33 +1071,6 @@ Example:
         }
 
         let fixes_text = String::new();
-        /*         // Stage 10
-        info!("Running Stage 10");
-
-        {
-            let stage = 10;
-            let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
-            let system_prompt = shared_context.clone();
-            let clean_system_prompt = clean_shared_context.clone();
-            let findings_str = serde_json::to_string_pretty(&findings_json).unwrap_or_default();
-            let user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text containing git-formatted patches.",
-                stage_prompt, findings_str
-            );
-            let clean_user_prompt = format!(
-                "{}\n\nFindings:\n{}\n\nReturn raw text containing git-formatted patches.",
-                clean_stage_prompt, findings_str
-            );
-            if let Ok((result_text, t_in, t_out, t_cached)) = self
-                .run_ai_stage_raw(stage, system_prompt, clean_system_prompt, user_prompt, clean_user_prompt)
-                .await
-            {
-                total_tokens_in += t_in;
-                total_tokens_out += t_out;
-                total_tokens_cached += t_cached;
-                fixes_text = result_text;
-            }
-        } */
 
         let final_output = json!({
             "findings": findings_json,
