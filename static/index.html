@@ -546,6 +546,22 @@
             font-weight: 500;
         }
 
+        .ai-comment-critical {
+            border-left-color: #B71C1C !important;
+        }
+
+        .ai-comment-high {
+            border-left-color: #FF5722 !important;
+        }
+
+        .ai-comment-medium {
+            border-left-color: #FF9800 !important;
+        }
+
+        .ai-comment-low {
+            border-left-color: #FBC02D !important;
+        }
+
         /* Thread tree */
         .thread-tree {
             font-size: 0.95em;
@@ -1182,6 +1198,17 @@
                         type = 'EMPTY';
                     }
 
+                    // Parse severity if this is a potential comment candidate
+                    let severity = null;
+                    let displayLine = line;
+                    if (type === 'TEXT' && renderAiComments) {
+                        const severityMatch = line.match(/\[Severity:\s*(Critical|High|Medium|Low)\]/i);
+                        if (severityMatch) {
+                            severity = severityMatch[1].toLowerCase();
+                            displayLine = line.replace(/\[Severity:\s*(Critical|High|Medium|Low)\]/i, '').trim();
+                        }
+                    }
+
                     // Store metadata for rendering
                     let cls = 'diff-line';
                     if (isHeader) cls += ' diff-header';
@@ -1190,51 +1217,70 @@
                          else if (content.startsWith('-') && !content.startsWith('---') && content.trim() !== '--') cls += ' diff-removed';
                     }
 
-                    return { line, type, cls };
+                    return { line: displayLine, type, cls, severity };
                 });
 
-                // Pass 2: Render with lookahead/buffering
-                let resultHtml = '';
-                let buffer = [];
-                let lastType = 'DIFF'; // Initial state: DIFF (so leading empty lines are not highlighted)
-
+                // Pass 2: Group into logical blocks and propagate severity
+                let blocks = [];
+                let currentBlock = null;
+                
                 for (let i = 0; i < classified.length; i++) {
                     const item = classified[i];
-                    
-                    if (item.type === 'EMPTY') {
-                        buffer.push(item);
-                    } else {
-                        // Flush buffer
-                        if (buffer.length > 0) {
-                            // If bridging TEXT -> TEXT, highlight buffer
-                            const highlightBuffer = (lastType === 'TEXT' && item.type === 'TEXT');
-                            buffer.forEach(b => {
-                                let c = b.cls;
-                                if (highlightBuffer && renderAiComments) c += ' ai-comment';
-                                resultHtml += `<div class="${c}">${b.line}</div>`;
-                            });
-                            buffer = [];
+                    if (item.type === 'TEXT') {
+                        if (!currentBlock) {
+                            currentBlock = { type: 'COMMENT', items: [], severity: null };
+                            blocks.push(currentBlock);
                         }
-                        
-                        // Output current
-                        let c = item.cls;
-                        if (item.type === 'TEXT' && renderAiComments) c += ' ai-comment';
-                        resultHtml += `<div class="${c}">${item.line}</div>`;
-                        
-                        lastType = item.type;
+                        currentBlock.items.push(item);
+                        if (item.severity) {
+                            currentBlock.severity = item.severity;
+                        }
+                    } else if (item.type === 'EMPTY') {
+                        if (currentBlock) {
+                            currentBlock.items.push(item);
+                        } else {
+                            blocks.push({ type: 'EMPTY', item: item });
+                        }
+                    } else { // DIFF
+                        if (currentBlock) {
+                            // Split trailing EMPTY lines out of the block
+                            let trailingEmpty = [];
+                            while (currentBlock.items.length > 0 && currentBlock.items[currentBlock.items.length - 1].type === 'EMPTY') {
+                                trailingEmpty.unshift(currentBlock.items.pop());
+                            }
+                            currentBlock = null;
+                            trailingEmpty.forEach(e => blocks.push({ type: 'EMPTY', item: e }));
+                        }
+                        blocks.push({ type: 'DIFF', item: item });
                     }
                 }
                 
-                // Flush remaining buffer (trailing empty lines)
-                if (buffer.length > 0) {
-                     // Don't render trailing blank lines that bloat the end of the block
-                     while (buffer.length > 0 && buffer[buffer.length - 1].line.trim() === '') {
-                         buffer.pop();
-                     }
-                     buffer.forEach(b => {
-                        resultHtml += `<div class="${b.cls}">${b.line}</div>`;
-                    });
+                // Handle end of loop trailing empty lines
+                if (currentBlock) {
+                    while (currentBlock.items.length > 0 && currentBlock.items[currentBlock.items.length - 1].type === 'EMPTY') {
+                        currentBlock.items.pop(); // Drop trailing blank lines completely to prevent bloating
+                    }
                 }
+                
+                // Render blocks
+                let resultHtml = '';
+                blocks.forEach(block => {
+                    if (block.type === 'COMMENT') {
+                        const sevClass = block.severity ? ` ai-comment-${block.severity}` : '';
+                        block.items.forEach(item => {
+                            if (item.line === "" && item.severity !== null) {
+                                return; // Skip the tag-only line
+                            }
+                            let c = item.cls;
+                            if (renderAiComments) c += ' ai-comment' + sevClass;
+                            resultHtml += `<div class="${c}">${item.line}</div>`;
+                        });
+                    } else if (block.type === 'EMPTY') {
+                        resultHtml += `<div class="${block.item.cls}">${block.item.line}</div>`;
+                    } else if (block.type === 'DIFF') {
+                        resultHtml += `<div class="${block.item.cls}">${block.item.line}</div>`;
+                    }
+                });
                 
                 return resultHtml;
             }

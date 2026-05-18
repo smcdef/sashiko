@@ -233,6 +233,7 @@ Create a note for these items, all of which your report should include:
   in the diff that introduced them.  Do not put the quoting '> ' characters in
   front of your new text.
 - [ ] Place your questions as close as possible to the buggy section of code.
+- [ ] Place a severity tag in square brackets on its own line right above each inline comment block, exactly in this format: `[Severity: <level>]` (where <level> is Critical, High, Medium, or Low).
 - [ ] Snip portions of the quoted content unrelated to your review
   - [ ] Check every hunk to see if it is relevant to the review comments.
   - [ ] ensure diff headers are retained for the files owning any hunks keep
@@ -285,6 +286,7 @@ mm, swap: only scan one cluster in fragment list
 > -			atomic_long_dec(&si->frag_cluster_nr[order]);
                         ^^^^
 
+[Severity: High]
 Is it ok to remove this atomic_long_dec()?  It looks like the counter
 updates are getting lost.
 
@@ -303,7 +305,9 @@ updates are getting lost.
 > +		 * Scan only one fragment cluster is good enough. Order 0
 > +		 * allocation will surely success, and large allocation
 > +		 * allocation will surely success, and large allocation
-                 ^^^^^^^^ this isn't a bug, but you've duplicated this line
+                 ^^^^^^^^
+[Severity: Low]
+                 this isn't a bug, but you've duplicated this line
 
 > +		 * failure is not critical. Scanning one cluster still
 > +		 * keeps the list rotated and reclaimed (for HAS_CACHE).
