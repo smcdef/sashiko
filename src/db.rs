@@ -438,6 +438,7 @@ impl Database {
         let _ = self.try_add_column("patches", "status", "TEXT").await;
         let _ = self.try_add_column("patches", "apply_error", "TEXT").await;
         self.migrate_patches_message_id_uniqueness().await?;
+        self.migrate_stale_fetching_placeholders().await?;
         let _ = self.try_add_column("reviews", "provider", "TEXT").await;
         let _ = self
             .try_add_column("reviews", "prompts_git_hash", "TEXT")
@@ -1321,6 +1322,101 @@ impl Database {
         }
 
         Ok(false)
+    }
+
+    async fn migrate_stale_fetching_placeholders(&self) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, cover_letter_message_id, skip_filters, only_filters
+                 FROM patchsets
+                 WHERE status = 'Fetching'
+                   AND subject LIKE 'Fetching % from local...'
+                   AND total_parts IS NULL
+                   AND received_parts IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patches WHERE patchset_id = patchsets.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews WHERE patchset_id = patchsets.id
+                   )",
+                (),
+            )
+            .await?;
+
+        let mut placeholders = Vec::new();
+        while let Some(row) = rows.next().await? {
+            placeholders.push((
+                row.get::<i64>(0)?,
+                row.get::<String>(1)?,
+                row.get::<Option<String>>(2).ok().flatten(),
+                row.get::<Option<String>>(3).ok().flatten(),
+            ));
+        }
+        drop(rows);
+
+        for (placeholder_id, cover_id, skip_filters, only_filters) in placeholders {
+            let Some(prefix) = cover_id.strip_suffix("@sashiko.local") else {
+                continue;
+            };
+            if !(7..=40).contains(&prefix.len()) || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+
+            let like_pattern = format!("{prefix}%");
+            let mut real_rows = self
+                .conn
+                .query(
+                    "SELECT ps.id
+                     FROM patchsets ps
+                     JOIN patches p ON p.patchset_id = ps.id
+                     WHERE ps.id != ?
+                       AND ps.total_parts = 1
+                       AND p.part_index = 1
+                       AND p.message_id LIKE ?
+                     ORDER BY ps.id
+                     LIMIT 1",
+                    libsql::params![placeholder_id, like_pattern],
+                )
+                .await?;
+
+            let Some(real_row) = real_rows.next().await? else {
+                continue;
+            };
+            let real_id: i64 = real_row.get(0)?;
+            drop(real_rows);
+
+            self.conn
+                .execute(
+                    "UPDATE patchsets
+                     SET skip_filters = COALESCE(skip_filters, ?),
+                         only_filters = COALESCE(only_filters, ?)
+                     WHERE id = ?",
+                    libsql::params![skip_filters, only_filters, real_id],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM patchsets_subsystems WHERE patchset_id = ?",
+                    libsql::params![placeholder_id],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM patchsets
+                     WHERE id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM patches WHERE patchset_id = ?
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM reviews WHERE patchset_id = ?
+                       )",
+                    libsql::params![placeholder_id, placeholder_id, placeholder_id],
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 
     // People & Recipients
@@ -3590,6 +3686,20 @@ impl Database {
             .execute(
                 "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
                 libsql::params![error, root_msg_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_patchset_cover_letter_message_id(
+        &self,
+        patchset_id: i64,
+        cover_letter_message_id: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                libsql::params![cover_letter_message_id, patchset_id],
             )
             .await?;
         Ok(())
@@ -5929,6 +6039,132 @@ mod tests {
             .unwrap();
         let count = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_short_sha_fetching_placeholder_is_reused_for_singleton() {
+        let db = setup_db().await;
+        let short_sha = "e6720191bd29";
+        let full_sha = "e6720191bd2963314f5410014452876ea96c32cf";
+        let placeholder_id = db
+            .create_fetching_patchset(
+                short_sha,
+                &format!("Fetching {short_sha} from local..."),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let thread_id = db
+            .create_thread(full_sha, "mm/mm_init: Check zone consistency", 1000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            full_sha,
+            thread_id,
+            None,
+            "Author",
+            "mm/mm_init: Check zone consistency",
+            1000,
+        )
+        .await;
+
+        let ps_id = create_test_patchset(
+            &db,
+            thread_id,
+            Some(&format!("{short_sha}@sashiko.local")),
+            full_sha,
+            "mm/mm_init: Check zone consistency",
+            "Author",
+            1000,
+            1,
+            1,
+        )
+        .await;
+        assert_eq!(ps_id, placeholder_id);
+
+        db.update_patchset_cover_letter_message_id(ps_id, full_sha)
+            .await
+            .unwrap();
+        db.create_patch(ps_id, full_sha, 1, "diff").await.unwrap();
+
+        let details = db
+            .get_patchset_details_by_msgid(full_sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["id"].as_i64(), Some(placeholder_id));
+        assert_eq!(details["status"].as_str(), Some("Pending"));
+        assert_eq!(
+            details["subject"].as_str(),
+            Some("mm/mm_init: Check zone consistency")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrates_stale_short_sha_fetching_placeholder() {
+        let db = setup_db().await;
+        let short_sha = "e6720191bd29";
+        let full_sha = "e6720191bd2963314f5410014452876ea96c32cf";
+        let skip_filters = vec!["mm/*".to_string()];
+        let placeholder_id = db
+            .create_fetching_patchset(
+                short_sha,
+                &format!("Fetching {short_sha} from local..."),
+                Some(&skip_filters),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let thread_id = db
+            .create_thread(full_sha, "mm/mm_init: Check zone consistency", 1000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            full_sha,
+            thread_id,
+            None,
+            "Author",
+            "mm/mm_init: Check zone consistency",
+            1000,
+        )
+        .await;
+        let real_id = create_test_patchset(
+            &db,
+            thread_id,
+            Some(full_sha),
+            full_sha,
+            "mm/mm_init: Check zone consistency",
+            "Author",
+            1000,
+            1,
+            1,
+        )
+        .await;
+        assert_ne!(real_id, placeholder_id);
+        db.create_patch(real_id, full_sha, 1, "diff").await.unwrap();
+
+        db.migrate_stale_fetching_placeholders().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query("SELECT id, skip_filters FROM patchsets ORDER BY id", ())
+            .await
+            .unwrap();
+
+        let mut patchsets = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            patchsets.push((
+                row.get::<i64>(0).unwrap(),
+                row.get::<Option<String>>(1).ok().flatten(),
+            ));
+        }
+
+        assert_eq!(patchsets, vec![(real_id, Some("[\"mm/*\"]".to_string()))]);
     }
 
     #[tokio::test]
