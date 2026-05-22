@@ -299,7 +299,8 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
+                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?
+                 ORDER BY date DESC, id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -312,7 +313,11 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
+                "SELECT p.patchset_id
+                 FROM patches p
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.message_id = ?
+                 ORDER BY ps.date DESC, ps.id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -1837,7 +1842,18 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?",
+                    "SELECT id, date, author, subject, subject_index, total_parts, status
+                     FROM patchsets
+                     WHERE cover_letter_message_id = ?
+                     ORDER BY
+                        CASE
+                            WHEN status = 'Fetching' THEN 0
+                            WHEN status IN ('Incomplete', 'Pending', 'In Review', 'Applying', 'Reviewing') THEN 1
+                            WHEN status = 'Failed' THEN 2
+                            ELSE 3
+                        END,
+                        date DESC,
+                        id DESC",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -3232,7 +3248,8 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?",
+                "SELECT id FROM patchsets WHERE cover_letter_message_id = ?
+                 ORDER BY date DESC, id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -3244,7 +3261,11 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT patchset_id FROM patches WHERE message_id = ?",
+                "SELECT p.patchset_id
+                 FROM patches p
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.message_id = ?
+                 ORDER BY ps.date DESC, ps.id DESC LIMIT 1",
                 libsql::params![msg_id],
             )
             .await?;
@@ -3637,7 +3658,16 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT id, status FROM patchsets WHERE cover_letter_message_id = ?",
+                    "SELECT id, status FROM patchsets WHERE cover_letter_message_id = ?
+                     ORDER BY
+                        CASE
+                            WHEN status IN ('Fetching', 'Failed') THEN 0
+                            WHEN status IN ('Incomplete', 'Pending', 'In Review', 'Applying', 'Reviewing') THEN 1
+                            ELSE 2
+                        END,
+                        date DESC,
+                        id DESC
+                     LIMIT 1",
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -3647,14 +3677,22 @@ impl Database {
                 let status: String = row.get(1).unwrap_or_default();
 
                 // Only reset to Fetching if it failed or is currently fetching.
-                // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
+                // We don't want to reset if it is already Incomplete or Pending.
+                // Reviewed/Cancelled patchsets are completed submissions; a new
+                // API request for the same local commit should create a new run.
                 if status == "Failed" || status == "Fetching" {
                     self.conn.execute(
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ? WHERE id = ?",
                         libsql::params![skip_filters_json.clone(), only_filters_json.clone(), id]
                     ).await?;
+                    return Ok(id);
                 }
-                return Ok(id);
+                if matches!(
+                    status.as_str(),
+                    "Incomplete" | "Pending" | "In Review" | "Applying" | "Reviewing"
+                ) {
+                    return Ok(id);
+                }
             }
         }
 
@@ -6101,6 +6139,93 @@ mod tests {
             details["subject"].as_str(),
             Some("mm/mm_init: Check zone consistency")
         );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_reviewed_local_commit_creates_new_fetching_patchset() {
+        let db = setup_db().await;
+        let full_sha = "93880926243211e066b07426c5d8fa4a46052cc8";
+        let synthetic_cover = format!("{full_sha}@sashiko.local");
+
+        let first_id = db
+            .create_fetching_patchset(
+                full_sha,
+                &format!("Fetching {full_sha} from local..."),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let thread_id = db
+            .create_thread(full_sha, "mm/mm_init: Initialize pageblock", 2000)
+            .await
+            .unwrap();
+        create_test_message(
+            &db,
+            full_sha,
+            thread_id,
+            None,
+            "Author",
+            "mm/mm_init: Initialize pageblock",
+            2000,
+        )
+        .await;
+        db.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ?, status = 'Reviewed', date = ? WHERE id = ?",
+                libsql::params![full_sha, 1000_i64, first_id],
+            )
+            .await
+            .unwrap();
+
+        let second_id = db
+            .create_fetching_patchset(
+                full_sha,
+                &format!("Fetching {full_sha} from local..."),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(first_id, second_id);
+
+        let matched_id = create_test_patchset(
+            &db,
+            thread_id,
+            Some(&synthetic_cover),
+            full_sha,
+            "mm/mm_init: Initialize pageblock",
+            "Author",
+            2000,
+            1,
+            1,
+        )
+        .await;
+        assert_eq!(matched_id, second_id);
+
+        db.update_patchset_cover_letter_message_id(second_id, full_sha)
+            .await
+            .unwrap();
+        db.create_patch(first_id, full_sha, 1, "old review diff")
+            .await
+            .unwrap();
+        db.create_patch(second_id, full_sha, 1, "new review diff")
+            .await
+            .unwrap();
+
+        let details = db
+            .get_patchset_details_by_msgid(full_sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["id"].as_i64(), Some(second_id));
+
+        let summary = db
+            .get_patchset_summary_by_msgid(full_sha, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["id"].as_i64(), Some(second_id));
     }
 
     #[tokio::test]
